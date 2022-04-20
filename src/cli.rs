@@ -246,13 +246,13 @@ pub async fn upload(
         pb.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})"));
         pb.enable_steady_tick(1000);
-        let mut uploaded = 0;
+        let mut uploaded:u64 = 0;
 
         let instant = Instant::now();
         let video = uploader
             .upload(client, limit, |len| {
-                uploaded += len;
-                pb.set_position(uploaded as u64);
+                uploaded += u64::try_from(len).unwrap();
+                pb.set_position(uploaded);
                 true
             })
             .await?;
