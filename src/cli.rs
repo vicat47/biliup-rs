@@ -1,18 +1,25 @@
 use anyhow::{anyhow, Context, Result};
+
 use biliup::client::{Client, LoginInfo};
 use biliup::line::Probe;
 use biliup::video::{BiliBili, Studio, Video};
-use biliup::{line, load_config};
-use clap::{IntoApp, Parser, Subcommand};
+use biliup::{line, load_config, VideoFile};
+use bytes::{Buf, Bytes};
+use clap::{CommandFactory, Parser, Subcommand};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Input;
 use dialoguer::Select;
+use futures::{Stream, StreamExt};
 use image::Luma;
 use indicatif::{ProgressBar, ProgressStyle};
 use qrcode::render::unicode;
 use qrcode::QrCode;
+use reqwest::Body;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+
+use std::task::Poll;
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -74,7 +81,7 @@ enum Commands {
 
         #[clap(flatten)]
         studio: Studio,
-    }
+    },
 }
 
 pub async fn parse() -> Result<()> {
@@ -139,7 +146,7 @@ pub async fn parse() -> Result<()> {
             println!("number of concurrent futures: {}", config.limit);
             for (filename_patterns, mut studio) in config.streamers {
                 let mut paths = Vec::new();
-                for entry in glob::glob(&format!("./{filename_patterns}"))?.filter_map(Result::ok) {
+                for entry in glob::glob(&filename_patterns)?.filter_map(Result::ok) {
                     paths.push(entry);
                 }
                 if paths.is_empty() {
@@ -151,7 +158,7 @@ pub async fn parse() -> Result<()> {
                     upload(&paths, &client, config.line.as_deref(), config.limit).await?;
                 studio.submit(&login_info).await?;
             }
-        },
+        }
         Commands::Append {
             video_path,
             avid,
@@ -176,10 +183,10 @@ pub async fn parse() -> Result<()> {
             studio.video_data(&login_info).await?;
             studio.videos.append(&mut uploaded_videos);
             studio.edit(&login_info).await?;
-        },
+        }
         _ => {
             println!("参数不正确请参阅帮助");
-            Cli::into_app().print_help()?
+            Cli::command().print_help()?
         }
     };
     Ok(())
@@ -233,33 +240,43 @@ pub async fn upload(
         Some("bda2") => line::bda2(),
         Some("ws") => line::ws(),
         Some("qn") => line::qn(),
+        Some("cos") => line::cos(),
+        Some("cos-internal") => line::cos_internal(),
         Some(name) => panic!("不正确的线路{name}"),
         None => Probe::probe().await.unwrap_or_default(),
     };
     // let line = line::kodo();
     for video_path in video_path {
         println!("{line:?}");
-        let uploader = line.to_uploader(video_path).await?;
+        let video_file = VideoFile::new(video_path)?;
+        let total_size = video_file.total_size;
+        let file_name = video_file.file_name.clone();
+        let uploader = line.to_uploader(video_file);
         //Progress bar
-        let total_size = uploader.total_size;
         let pb = ProgressBar::new(total_size);
         pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})"));
-        pb.enable_steady_tick(1000);
-        let mut uploaded = 0;
+            .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?);
+        // pb.enable_steady_tick(Duration::from_secs(1));
+        // pb.tick()
 
         let instant = Instant::now();
+
         let video = uploader
-            .upload(client, limit, |len| {
-                uploaded += len;
-                pb.set_position(uploaded as u64);
-                true
+            .upload(client, limit, |vs| {
+                vs.map(|chunk| {
+                    let pb = pb.clone();
+                    let (chunk, len) = chunk?;
+
+                    Ok((Progressbar::new(chunk, pb), len))
+                })
             })
             .await?;
         pb.finish_and_clear();
+        let t = instant.elapsed().as_millis();
         println!(
-            "Upload completed: {:.2} MB/s.",
-            total_size as f64 / 1000. / instant.elapsed().as_millis() as f64
+            "Upload completed: {file_name} => cost {:.2}s, {:.2} MB/s.",
+            t as f64 / 1000.,
+            total_size as f64 / 1000. / t as f64
         );
         videos.push(video);
     }
@@ -317,4 +334,56 @@ pub async fn login_by_browser(client: Client) -> Result<LoginInfo> {
     );
     println!("请复制此链接至浏览器中完成登录");
     client.login_by_qrcode(value).await
+}
+
+#[derive(Clone)]
+struct Progressbar {
+    bytes: Bytes,
+    pb: ProgressBar,
+}
+
+impl Progressbar {
+    pub fn new(bytes: Bytes, pb: ProgressBar) -> Self {
+        Self { bytes, pb }
+    }
+
+    pub fn progress(&mut self) -> Result<Option<Bytes>> {
+        let pb = &self.pb;
+
+        let content_bytes = &mut self.bytes;
+
+        let n = content_bytes.remaining();
+
+        let pc = 4096;
+        if n == 0 {
+            Ok(None)
+        } else if n < pc {
+            pb.inc(n as u64);
+            Ok(Some(content_bytes.copy_to_bytes(n)))
+        } else {
+            pb.inc(pc as u64);
+
+            Ok(Some(content_bytes.copy_to_bytes(pc)))
+        }
+    }
+}
+
+impl Stream for Progressbar {
+    type Item = Result<Bytes>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        match self.progress()? {
+            None => Poll::Ready(None),
+            Some(s) => Poll::Ready(Some(Ok(s))),
+        }
+    }
+}
+
+impl From<Progressbar> for Body {
+    fn from(async_stream: Progressbar) -> Self {
+        Body::wrap_stream(async_stream)
+    }
 }

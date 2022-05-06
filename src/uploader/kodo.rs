@@ -1,23 +1,22 @@
-use crate::read_chunk;
 use crate::Video;
 use anyhow::{anyhow, bail, Result};
-use async_std::fs::File;
 use base64::URL_SAFE;
-use futures::{StreamExt, TryStreamExt};
-use reqwest::header;
-use reqwest::header::{HeaderMap, HeaderName};
+
+use futures::{Stream, StreamExt, TryStreamExt};
+use reqwest::header::{HeaderMap, HeaderName, CONTENT_LENGTH};
+use reqwest::{header, Body};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::policies::ExponentialBackoff;
 use reqwest_retry::RetryTransientMiddleware;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::path::Path;
+
 use std::str::FromStr;
 use std::time::Duration;
 
 pub struct Kodo {
     client: ClientWithMiddleware,
+    raw_client: reqwest::Client,
     bucket: Bucket,
     url: String,
 }
@@ -29,49 +28,67 @@ impl Kodo {
             "Authorization",
             format!("UpToken {}", bucket.uptoken).parse()?,
         );
-        let client = reqwest::Client::builder()
+        let raw_client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/63.0.3239.108")
             .default_headers(headers)
             .timeout(Duration::new(60, 0))
             .build()
             .unwrap();
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
-        let client = ClientBuilder::new(client)
+        let client = ClientBuilder::new(raw_client.clone())
             // Retry failed requests.
             .with(RetryTransientMiddleware::new_with_policy(retry_policy))
             .build();
         let url = format!("https:{}/mkblk", bucket.endpoint); // 视频上传路径
         Ok(Kodo {
             client,
+            raw_client,
             bucket,
             url,
         })
     }
 
-    pub async fn upload_stream(
+    pub async fn upload_stream<F, B>(
         self,
-        file: File,
-        path: &Path,
+        // file: std::fs::File,
+        stream: F,
+        total_size: u64,
         limit: usize,
-        mut process: impl FnMut(usize) -> bool,
-    ) -> Result<Video> {
-        let total_size = file.metadata().await?.len();
-        let chunk_size = 4194304;
+        // mut process: impl FnMut(usize) -> bool,
+    ) -> Result<Video>
+    where
+        F: Stream<Item = Result<(B, usize)>>,
+        B: Into<Body> + Clone,
+    {
+        // let total_size = file.metadata()?.len();
+        let _chunk_size = 4194304;
         let mut parts = Vec::new();
         // let parts_cell = &RefCell::new(parts);
-        let client = &self.client;
+        let client = &self.raw_client;
         let url = &self.url;
 
-        let stream = read_chunk(file, chunk_size)
+        // let stream = read_chunk(file, chunk_size, process)
+        let stream = stream
             // let mut chunks = read_chunk(file, chunk_size)
             .enumerate()
             .map(|(i, chunk)| async move {
-                let chunk = chunk?;
-                let len = chunk.len();
+                let (chunk, len) = chunk?;
+                // let len = chunk.len();
                 // println!("{}", len);
-                let url = format!("{url}/{len}");
-                let ctx: serde_json::Value =
-                    client.post(url).body(chunk).send().await?.json().await?;
+                let ctx: serde_json::Value = super::retryable::retry(|| async {
+                    let url = format!("{url}/{len}");
+                    let response = client
+                        .post(url)
+                        .header(CONTENT_LENGTH, len)
+                        .body(chunk.clone())
+                        .send()
+                        .await?;
+                    response.error_for_status_ref()?;
+                    let res = response.json().await?;
+                    Ok::<_, reqwest::Error>(res)
+                })
+                .await?;
+
                 Ok::<_, reqwest_middleware::Error>((
                     Ctx {
                         index: i,
@@ -82,11 +99,8 @@ impl Kodo {
             })
             .buffer_unordered(limit);
         tokio::pin!(stream);
-        while let Some((part, size)) = stream.try_next().await? {
+        while let Some((part, _size)) = stream.try_next().await? {
             parts.push(part);
-            if !process(size) {
-                bail!("移除视频");
-            }
         }
         parts.sort_by_key(|x| x.index);
         let key = base64::encode_config(self.bucket.key, URL_SAFE);
@@ -122,10 +136,7 @@ impl Kodo {
                 bail!("{result}")
             }
             _ => Video {
-                title: path
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .map(|s| s.to_string()),
+                title: None,
                 filename: self.bucket.bili_filename,
                 desc: "".into(),
             },
