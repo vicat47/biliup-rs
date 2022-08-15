@@ -3,7 +3,7 @@
 ![GitHub all releases](https://img.shields.io/github/downloads/forgqi/biliup-rs/total)
 [![Telegram](https://img.shields.io/badge/Telegram-Group-blue.svg?logo=telegram)](https://t.me/+IkpIABHqy6U0ZTQ5)
 
-B 站命令行投稿工具，支持 **短信登录**，**账号密码登录**，**扫码登录**，**浏览器登录**
+B 站命令行投稿工具，支持 **短信登录**，**账号密码登录**，**扫码登录**，**浏览器登录**，**网页Cookie登录**
 ，并将登录后返回的 cookie 和 token 保存在 `cookie.json` 中，可用于其他项目。
 
 **文档地址**：<https://biliup.github.io/biliup-rs>
@@ -13,9 +13,9 @@ B 站命令行投稿工具，支持 **短信登录**，**账号密码登录**，
 
 [下载地址](https://github.com/ForgQi/biliup-rs/releases)
 
-## USEAGE
+## USAGE
 
-投稿支持两种模式：
+投稿支持**直接投稿**和对现有稿件**追加投稿**：
 * 快速投稿，输入 `biliup upload test1.mp4 test2.mp4` 即可快速多p投稿；
 * 通过配置文件投稿，配置文件详见 [config.yaml](examples/config.yaml) ，支持按照 Unix shell style patterns 来批量匹配视频文件，如 `/media/**/*.mp4` 匹配 media 及其子目录中的所有 mp4 文件且可以自由调整视频标题、简介、标签等：
 
@@ -38,11 +38,12 @@ OPTIONS:
         --dynamic <DYNAMIC>            空间动态 [default: ]
     -h, --help                         Print help information
         --interactive <INTERACTIVE>    [default: 0]
-    -l, --line <LINE>                  选择上传线路，支持kodo, bda2, qn, ws
+    -l, --line <LINE>                  选择上传线路 [possible values: bda2, ws, qn, kodo, cos, cos-
+                                       internal]
         --limit <LIMIT>                单视频文件最大并发数 [default: 3]
         --mission-id <MISSION_ID>
         --no-reprint <NO_REPRINT>      0-允许转载，1-禁止转载
-        --open-elec <OPEN_ELEC>
+        --open-elec <OPEN_ELEC>        是否开启充电, 0-关闭 1-开启
         --source <SOURCE>              转载来源 [default: ]
         --tag <TAG>                    视频标签，逗号分隔多个tag [default: ]
         --tid <TID>                    投稿分区 [default: 171]
@@ -53,6 +54,35 @@ OPTIONS:
 ```
  
 * 查看完整用法命令行输入 `biliup -h`
+```shell
+biliup 0.1.8
+Upload video to bilibili.
+
+USAGE:
+    biliup.exe [OPTIONS] <SUBCOMMAND>
+
+OPTIONS:
+    -u, --user-cookie <COOKIE_FILE>    登录信息文件 [default: cookies.json]
+    -h, --help                         Print help information
+    -V, --version                      Print version information
+
+SUBCOMMANDS:
+    append    是否要对某稿件追加视频
+    help      Print this message or the help of the given subcommand(s)
+    login     登录B站并保存登录信息
+    renew     手动验证并刷新登录信息
+    show      打印视频详情
+    upload    上传视频
+
+```
+
+### 多账号支持
+请在子命令**之前**通过 `-u` 或者 `--user-cookie` 参数传入 cookie 文件的路径（默认为当前目录下的 "cookies.json"）。例如：
+```shell
+$ biliup -u user1.json login
+$ biliup --user-cookie user2.json upload ...
+$ biliup renew  # ./cookies.json
+```
 
 ### Windows 演示
 
@@ -86,7 +116,7 @@ bilibili投稿模式分主要为fetch和直传两种，线路概览：
   - [x] kodo（七牛）
   - [ ] bos（百度）
   - [ ] gcs（谷歌）
-  - [ ] cos（腾讯）
+  - [x] cos（腾讯）
 
 B 站在上传前会通过 probe 来返回几条线路，并发包测试从中选择响应时间较短的，但对与国外的机器实际上不太准确，所以建议还是在实际测试后手动选择一条线路，实际测试大部分国外机器在kodo线路3并发的情况下能达到60-90MiB/s的速度，理论上增加并发数能跑满带宽。
 

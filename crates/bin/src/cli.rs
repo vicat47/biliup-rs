@@ -2,10 +2,10 @@ use anyhow::{anyhow, Context, Result};
 
 use biliup::client::{Client, LoginInfo};
 use biliup::line::Probe;
-use biliup::video::{BiliBili, Studio, Video};
+use biliup::video::{BiliBili, Studio, Vid, Video};
 use biliup::{line, load_config, VideoFile};
 use bytes::{Buf, Bytes};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{ArgEnum, CommandFactory, Parser, Subcommand};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::Input;
 use dialoguer::Select;
@@ -16,6 +16,7 @@ use qrcode::render::unicode;
 use qrcode::QrCode;
 use reqwest::Body;
 use std::ffi::OsStr;
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
@@ -31,12 +32,18 @@ struct Cli {
 
     #[clap(subcommand)]
     command: Commands,
+
+    /// 登录信息文件
+    #[clap(short, long, default_value = "cookies.json")]
+    user_cookie: PathBuf,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 登录B站并保存登录信息在执行目录下
+    /// 登录B站并保存登录信息
     Login,
+    /// 手动验证并刷新登录信息
+    Renew,
     /// 上传视频
     Upload {
         // Optional name to operate on
@@ -49,9 +56,9 @@ enum Commands {
         #[clap(short, long, parse(from_os_str), value_name = "FILE")]
         config: Option<PathBuf>,
 
-        /// 选择上传线路，支持kodo, bda2, qn, ws
-        #[clap(short, long)]
-        line: Option<String>,
+        /// 选择上传线路
+        #[clap(short, long, arg_enum)]
+        line: Option<UploadLine>,
 
         /// 单视频文件最大并发数
         #[clap(long, default_value = "3")]
@@ -60,20 +67,20 @@ enum Commands {
         #[clap(flatten)]
         studio: Studio,
     },
-    /// 追加视频
+    /// 是否要对某稿件追加视频
     Append {
         // Optional name to operate on
         // name: Option<String>,
-        /// 是否要对某稿件追加视频，avid为稿件 av 号
+        /// vid为稿件 av 或 bv 号
         #[clap(short, long)]
-        avid: u64,
+        vid: Vid,
         /// 需要上传的视频路径,若指定配置文件投稿不需要此参数
         #[clap(parse(from_os_str))]
         video_path: Vec<PathBuf>,
 
-        /// 选择上传线路，支持kodo, bda2, qn, ws
-        #[clap(short, long)]
-        line: Option<String>,
+        /// 选择上传线路
+        #[clap(short, long, arg_enum)]
+        line: Option<UploadLine>,
 
         /// 单视频文件最大并发数
         #[clap(long, default_value = "3")]
@@ -82,6 +89,22 @@ enum Commands {
         #[clap(flatten)]
         studio: Studio,
     },
+    /// 打印视频详情
+    Show {
+        /// vid为稿件 av 或 bv 号
+        // #[clap()]
+        vid: Vid,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, ArgEnum)]
+pub enum UploadLine {
+    Bda2,
+    Ws,
+    Qn,
+    Kodo,
+    Cos,
+    CosInternal,
 }
 
 pub async fn parse() -> Result<()> {
@@ -110,7 +133,10 @@ pub async fn parse() -> Result<()> {
     let client: Client = Default::default();
     match cli.command {
         Commands::Login => {
-            login(client).await?;
+            login(client, cli.user_cookie).await?;
+        }
+        Commands::Renew => {
+            renew(client, cli.user_cookie).await?;
         }
         Commands::Upload {
             video_path,
@@ -120,9 +146,7 @@ pub async fn parse() -> Result<()> {
             mut studio,
         } if !video_path.is_empty() => {
             println!("number of concurrent futures: {limit}");
-            let login_info = client
-                .login_by_cookies(std::fs::File::open("cookies.json")?)
-                .await?;
+            let login_info = client.login_by_cookies(fopen_rw(cli.user_cookie)?).await?;
             if studio.title.is_empty() {
                 studio.title = video_path[0]
                     .file_stem()
@@ -131,7 +155,7 @@ pub async fn parse() -> Result<()> {
                     .unwrap();
             }
             cover_up(&mut studio, &login_info, &client).await?;
-            studio.videos = upload(&video_path, &client, line.as_deref(), limit).await?;
+            studio.videos = upload(&video_path, &client, line, limit).await?;
             studio.submit(&login_info).await?;
         }
         Commands::Upload {
@@ -139,9 +163,7 @@ pub async fn parse() -> Result<()> {
             config: Some(config),
             ..
         } => {
-            let login_info = client
-                .login_by_cookies(std::fs::File::open("cookies.json")?)
-                .await?;
+            let login_info = client.login_by_cookies(fopen_rw(cli.user_cookie)?).await?;
             let config = load_config(&config)?;
             println!("number of concurrent futures: {}", config.limit);
             for (filename_patterns, mut studio) in config.streamers {
@@ -154,35 +176,38 @@ pub async fn parse() -> Result<()> {
                     continue;
                 }
                 cover_up(&mut studio, &login_info, &client).await?;
-                studio.videos =
-                    upload(&paths, &client, config.line.as_deref(), config.limit).await?;
+
+                studio.videos = upload(
+                    &paths,
+                    &client,
+                    config
+                        .line
+                        .as_ref()
+                        .and_then(|l| UploadLine::from_str(l, true).ok()),
+                    config.limit,
+                )
+                .await?;
                 studio.submit(&login_info).await?;
             }
         }
         Commands::Append {
             video_path,
-            avid,
+            vid,
             line,
             limit,
-            mut studio,
+            studio: _,
         } if !video_path.is_empty() => {
             println!("number of concurrent futures: {limit}");
-            let login_info = client
-                .login_by_cookies(std::fs::File::open("cookies.json")?)
-                .await?;
-            if studio.title.is_empty() {
-                studio.title = video_path[0]
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .map(|s| s.to_string())
-                    .unwrap();
-            }
-            studio.aid = Option::from(avid);
-            let mut uploaded_videos = upload(&video_path, &client, line.as_deref(), limit).await?;
-            // 更改为 通过 studio 发送请求
-            studio.video_data(&login_info).await?;
+            let login_info = client.login_by_cookies(fopen_rw(cli.user_cookie)?).await?;
+            let mut uploaded_videos = upload(&video_path, &client, line, limit).await?;
+            let mut studio = BiliBili::new(&login_info, &client).studio_data(vid).await?;
             studio.videos.append(&mut uploaded_videos);
             studio.edit(&login_info).await?;
+        }
+        Commands::Show { vid } => {
+            let login_info = client.login_by_cookies(fopen_rw(cli.user_cookie)?).await?;
+            let video_info = BiliBili::new(&login_info, &client).video_data(vid).await?;
+            println!("{}", serde_json::to_string_pretty(&video_info)?)
         }
         _ => {
             println!("参数不正确请参阅帮助");
@@ -192,7 +217,7 @@ pub async fn parse() -> Result<()> {
     Ok(())
 }
 
-async fn login(client: Client) -> Result<()> {
+async fn login(client: Client, user_cookie: PathBuf) -> Result<()> {
     let selection = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("选择一种登录方式")
         .default(1)
@@ -200,17 +225,30 @@ async fn login(client: Client) -> Result<()> {
         .item("短信登录")
         .item("扫码登录")
         .item("浏览器登录")
+        .item("网页Cookie登录")
         .interact()?;
     let info = match selection {
         0 => login_by_password(client).await?,
         1 => login_by_sms(client).await?,
         2 => login_by_qrcode(client).await?,
         3 => login_by_browser(client).await?,
+        4 => login_by_web_cookies(client).await?,
         _ => panic!(),
     };
-    let file = std::fs::File::create("cookies.json")?;
+    let file = std::fs::File::create(user_cookie)?;
     serde_json::to_writer_pretty(&file, &info)?;
     println!("登录成功，数据保存在{:?}", file);
+    Ok(())
+}
+
+async fn renew(client: Client, user_cookie: PathBuf) -> Result<()> {
+    let mut file = fopen_rw(user_cookie)?;
+    let login_info: LoginInfo = serde_json::from_reader(&file)?;
+    let new_info = client.renew_tokens(login_info).await?;
+    file.rewind()?;
+    file.set_len(0)?;
+    serde_json::to_writer_pretty(std::io::BufWriter::new(&file), &new_info)?;
+    println!("{new_info:?}");
     Ok(())
 }
 
@@ -231,24 +269,31 @@ async fn cover_up(studio: &mut Studio, login_info: &LoginInfo, client: &Client) 
 pub async fn upload(
     video_path: &[PathBuf],
     client: &Client,
-    line: Option<&str>,
+    line: Option<UploadLine>,
     limit: usize,
 ) -> Result<Vec<Video>> {
     let mut videos = Vec::new();
     let line = match line {
-        Some("kodo") => line::kodo(),
-        Some("bda2") => line::bda2(),
-        Some("ws") => line::ws(),
-        Some("qn") => line::qn(),
-        Some("cos") => line::cos(),
-        Some("cos-internal") => line::cos_internal(),
-        Some(name) => panic!("不正确的线路{name}"),
+        // Some("kodo") => line::kodo(),
+        // Some("bda2") => line::bda2(),
+        // Some("ws") => line::ws(),
+        // Some("qn") => line::qn(),
+        // Some("cos") => line::cos(),
+        // Some("cos-internal") => line::cos_internal(),
+        // Some(name) => panic!("不正确的线路{name}"),
+        Some(UploadLine::Kodo) => line::kodo(),
+        Some(UploadLine::Bda2) => line::bda2(),
+        Some(UploadLine::Ws) => line::ws(),
+        Some(UploadLine::Qn) => line::qn(),
+        Some(UploadLine::Cos) => line::cos(),
+        Some(UploadLine::CosInternal) => line::cos_internal(),
         None => Probe::probe().await.unwrap_or_default(),
     };
     // let line = line::kodo();
     for video_path in video_path {
         println!("{line:?}");
-        let video_file = VideoFile::new(video_path)?;
+        let video_file = VideoFile::new(video_path)
+            .with_context(|| format!("file {}", video_path.to_string_lossy()))?;
         let total_size = video_file.total_size;
         let file_name = video_file.file_name.clone();
         let uploader = line.to_uploader(video_file);
@@ -265,8 +310,8 @@ pub async fn upload(
             .upload(client, limit, |vs| {
                 vs.map(|chunk| {
                     let pb = pb.clone();
-                    let (chunk, len) = chunk?;
-
+                    let chunk = chunk?;
+                    let len = chunk.len();
                     Ok((Progressbar::new(chunk, pb), len))
                 })
             })
@@ -290,7 +335,7 @@ pub async fn login_by_password(client: Client) -> Result<LoginInfo> {
     let password: String = Input::with_theme(&ColorfulTheme::default())
         .with_prompt("请输入密码")
         .interact()?;
-    client.login_by_password(&username, &password).await
+    Ok(client.login_by_password(&username, &password).await?)
 }
 
 pub async fn login_by_sms(client: Client) -> Result<LoginInfo> {
@@ -306,12 +351,18 @@ pub async fn login_by_sms(client: Client) -> Result<LoginInfo> {
         .with_prompt("请输入验证码")
         .interact_text()?;
     // println!("{}", payload);
-    client.login_by_sms(input, res).await
+    Ok(client.login_by_sms(input, res).await?)
 }
 
 pub async fn login_by_qrcode(client: Client) -> Result<LoginInfo> {
     let value = client.get_qrcode().await?;
-    let code = QrCode::new(value["data"]["url"].as_str().unwrap()).unwrap();
+    let code = QrCode::new(
+        value["data"]["url"]
+            .as_str()
+            .unwrap()
+            .replace("https", "http"),
+    )
+    .unwrap();
     let image = code
         .render::<unicode::Dense1x2>()
         .dark_color(unicode::Dense1x2::Light)
@@ -323,17 +374,29 @@ pub async fn login_by_qrcode(client: Client) -> Result<LoginInfo> {
     println!("在Windows下建议使用Windows Terminal(支持utf8，可完整显示二维码)\n否则可能无法正常显示，此时请打开./qrcode.png扫码");
     // Save the image.
     image.save("qrcode.png").unwrap();
-    client.login_by_qrcode(value).await
+    Ok(client.login_by_qrcode(value).await?)
 }
 
 pub async fn login_by_browser(client: Client) -> Result<LoginInfo> {
     let value = client.get_qrcode().await?;
     println!(
         "{}",
-        value["data"]["url"].as_str().ok_or(anyhow!("{}", value))?
+        value["data"]["url"]
+            .as_str()
+            .ok_or_else(|| anyhow!("{}", value))?
     );
     println!("请复制此链接至浏览器中完成登录");
-    client.login_by_qrcode(value).await
+    Ok(client.login_by_qrcode(value).await?)
+}
+
+pub async fn login_by_web_cookies(client: Client) -> Result<LoginInfo> {
+    let sess_data: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("请输入SESSDATA")
+        .interact_text()?;
+    let bili_jct: String = Input::with_theme(&ColorfulTheme::default())
+        .with_prompt("请输入bili_jct")
+        .interact_text()?;
+    Ok(client.login_by_web_cookies(&sess_data, &bili_jct).await?)
 }
 
 #[derive(Clone)]
@@ -386,4 +449,14 @@ impl From<Progressbar> for Body {
     fn from(async_stream: Progressbar) -> Self {
         Body::wrap_stream(async_stream)
     }
+}
+
+#[inline]
+fn fopen_rw<P: AsRef<Path>>(path: P) -> Result<std::fs::File> {
+    let path = path.as_ref();
+    std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| String::from("open cookies file: ") + &path.to_string_lossy())
 }

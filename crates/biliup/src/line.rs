@@ -1,10 +1,10 @@
 use crate::client::Client;
+use crate::error::Result;
 use crate::uploader::cos::Cos;
 use crate::uploader::kodo::Kodo;
 use crate::uploader::upos::Upos;
 use crate::uploader::Uploader;
 use crate::{Video, VideoFile, VideoStream};
-use anyhow::{Context, Result};
 use futures::{Stream, TryStreamExt};
 use reqwest::Body;
 use serde::de::DeserializeOwned;
@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::ffi::OsStr;
 
+use crate::error::CustomError::Custom;
 use std::time::Instant;
+use tracing::info;
 
 pub struct Parcel<'a> {
     line: &'a Line,
@@ -38,7 +40,7 @@ impl<'a> Parcel<'a> {
             "name": file_name,
             "size": total_size,
         });
-        println!("pre_upload: {}", params);
+        info!("pre_upload: {}", params);
         Self {
             line,
             params,
@@ -47,7 +49,7 @@ impl<'a> Parcel<'a> {
     }
 
     pub async fn pre_upload<T: DeserializeOwned>(&self, login: &Client) -> Result<T> {
-        login
+        let response = login
             .client
             .get(format!(
                 "https://member.bilibili.com/preupload?{}",
@@ -55,10 +57,14 @@ impl<'a> Parcel<'a> {
             ))
             .query(&self.params)
             .send()
-            .await?
-            .json()
-            .await
-            .with_context(|| "Failed to pre_upload from".to_string())
+            .await?;
+        if !response.status().is_success() {
+            return Err(Custom(format!(
+                "Failed to pre_upload from {}",
+                response.text().await?
+            )));
+        }
+        Ok(response.json().await?)
     }
 
     pub async fn upload<F, S, B>(&self, client: &Client, limit: usize, progress: F) -> Result<Video>
@@ -166,7 +172,7 @@ impl Probe {
                 == 200
             {
                 line.cost = instant.elapsed().as_millis();
-                println!("{}: {}", line.query, line.cost);
+                info!("{}: {}", line.query, line.cost);
                 if choice_line.cost > line.cost {
                     choice_line = line
                 }
